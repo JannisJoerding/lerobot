@@ -375,7 +375,7 @@ if __name__ == "__main__":
     base_parser.add_argument(
         "--robot-path",
         type=str,
-        default="lerobot/configs/robot/koch.yaml",
+        default="lerobot/configs/robot/aloha.yaml",
         help="Path to robot yaml file used to instantiate the robot using `make_robot` factory function.",
     )
     base_parser.add_argument(
@@ -398,6 +398,17 @@ if __name__ == "__main__":
         "--fps", type=none_or_int, default=None, help="Frames per second (set to None to disable)"
     )
     parser_teleop.add_argument(
+        "--display-cameras",
+        type=int,
+        default=1,
+        help="Display all cameras on screen (set to 1 to display or 0).",
+    )
+
+    parser_gelloha = subparsers.add_parser("teleoperate_gelloha", parents=[base_parser])
+    parser_gelloha.add_argument(
+        "--fps", type=none_or_int, default=None, help="Frames per second (set to None to disable)"
+    )
+    parser_gelloha.add_argument(
         "--display-cameras",
         type=int,
         default=1,
@@ -555,6 +566,7 @@ if __name__ == "__main__":
     del kwargs["robot_overrides"]
 
     robot_cfg = init_hydra_config(robot_path, robot_overrides)
+    print(robot_cfg)
     robot = make_robot(robot_cfg)
 
     if control_mode == "calibrate":
@@ -568,6 +580,9 @@ if __name__ == "__main__":
 
     elif control_mode == "replay":
         replay(robot, **kwargs)
+
+    elif control_mode == "teleoperate_gelloha":
+        teleoperate(robot, **kwargs)
 
     if robot.is_connected:
         # Disconnect manually to avoid a "Core dump" during process

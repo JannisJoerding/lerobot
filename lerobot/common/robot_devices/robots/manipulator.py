@@ -62,10 +62,17 @@ class ManipulatorRobotConfig:
     # motors).
     max_relative_target: list[float] | float | None = None
 
+    # The duration of the velocity-based time profile
+    # Higher values lead to smoother motions, but increase lag.
+    # Only applicable to aloha
+    moving_time: float = 0.1
+
     # Optionally set the leader arm in torque mode with the gripper motor set to this angle. This makes it
     # possible to squeeze the gripper and have it spring back to an open position on its own. If None, the
     # gripper is not put in torque mode.
     gripper_open_degree: float | None = None
+
+    joint_position_relative_bounds: dict[np.ndarray] | None = None
 
     def __setattr__(self, prop: str, val):
         if prop == "max_relative_target" and val is not None and isinstance(val, Sequence):
@@ -78,6 +85,9 @@ class ManipulatorRobotConfig:
                         "Note: This feature does not yet work with robots where different follower arms have "
                         "different numbers of motors."
                     )
+        if prop == "joint_position_relative_bounds" and val is not None:
+            for key in val:
+                val[key] = torch.tensor(val[key])
         super().__setattr__(prop, val)
 
     def __post_init__(self):
@@ -448,11 +458,20 @@ class ManipulatorRobot:
                 elbow_idx = arm.read("ID", "elbow")
                 arm.write("Secondary_ID", elbow_idx, "elbow_shadow")
 
+        def set_drive_mode_(arm):
+            # set the drive mode to time-based profile to set moving time via velocity profiles
+            drive_mode = arm.read('Drive_Mode')
+            for i in range(len(arm.motor_names)):
+                drive_mode[i] |= 1 << 2  # set third bit to enable time-based profiles
+            arm.write('Drive_Mode', drive_mode)
+
         for name in self.follower_arms:
             set_shadow_(self.follower_arms[name])
+            set_drive_mode_(self.follower_arms[name])
 
         for name in self.leader_arms:
             set_shadow_(self.leader_arms[name])
+            set_drive_mode_(self.follower_arms[name])
 
         for name in self.follower_arms:
             # Set a velocity limit of 131 as advised by Trossen Robotics
@@ -477,6 +496,13 @@ class ManipulatorRobot:
 
             # Note: We can't enable torque on the leader gripper since "xc430-w150" doesn't have
             # a Current Controlled Position mode.
+
+        # set time profile after setting operation mode
+        for name in self.follower_arms:
+            self.follower_arms[name].write("Profile_Velocity", int(self.config.moving * 1000))
+
+        for name in self.leader_arms:
+            self.leader_arms[name].write("Profile_Velocity", int(self.config.moving * 1000))
 
         if self.config.gripper_open_degree is not None:
             warnings.warn(
@@ -521,7 +547,17 @@ class ManipulatorRobot:
         follower_goal_pos = {}
         for name in self.follower_arms:
             before_fwrite_t = time.perf_counter()
-            goal_pos = leader_pos[name]
+            tmp = leader_pos[name].tolist()
+            print(tmp)
+            
+            
+            tmp.insert(2, tmp[1])  # Invert shadow joints
+            tmp.insert(4, tmp[3])  # Invert shadow joints
+            print(tmp)
+            
+            goal_pos = torch.tensor(tmp)
+            
+            #goal_pos = leader_pos[name]
 
             # Cap goal position when too far away from present position.
             # Slower fps expected due to reading from the follower.
@@ -684,3 +720,158 @@ class ManipulatorRobot:
     def __del__(self):
         if getattr(self, "is_connected", False):
             self.disconnect()
+
+class CustomManipulatorRobot(ManipulatorRobot):
+    def __init__(
+        self,
+        config: ManipulatorRobotConfig | None = None,
+        calibration_dir: Path = ".cache/calibration/koch",
+        **kwargs,
+    ):
+        if config is None:
+            config = ManipulatorRobotConfig()
+        # Overwrite config arguments using kwargs
+        self.config = replace(config, **kwargs)
+        self.calibration_dir = Path(calibration_dir)
+
+        self.robot_type = self.config.robot_type
+        self.leader_arms = self.config.leader_arms
+        self.follower_arms = self.config.follower_arms
+        self.cameras = self.config.cameras
+        self.is_connected = False
+        self.logs = {}
+        
+
+    def set_aloha_robot_preset(self):
+        def set_shadow_(arm):
+            # Set secondary/shadow ID for shoulder and elbow. These joints have two motors.
+            # As a result, if only one of them is required to move to a certain position,
+            # the other will follow. This is to avoid breaking the motors.
+            if "shoulder_shadow" in arm.motor_names:
+                shoulder_idx = arm.read("ID", "shoulder")
+                arm.write("Secondary_ID", shoulder_idx, "shoulder_shadow")
+
+            if "elbow_shadow" in arm.motor_names:
+                elbow_idx = arm.read("ID", "elbow")
+                arm.write("Secondary_ID", elbow_idx, "elbow_shadow")
+            
+        def set_drive_mode_(arm):
+            # set the drive mode to time-based profile to set moving time via velocity profiles
+            drive_mode = arm.read('Drive_Mode')
+            for i in range(len(arm.motor_names)):
+                drive_mode[i] |= 1 << 2  # set third bit to enable time-based profiles
+            arm.write('Drive_Mode', drive_mode)
+
+        for name in self.follower_arms:
+            set_shadow_(self.follower_arms[name])
+            set_drive_mode_(self.follower_arms[name])
+
+        for name in self.leader_arms:
+            set_drive_mode_(self.follower_arms[name])
+
+        for name in self.follower_arms:
+            # Set a velocity limit of 131 as advised by Trossen Robotics
+            self.follower_arms[name].write("Velocity_Limit", 131)
+
+            # Use 'extended position mode' for all motors except gripper, because in joint mode the servos can't
+            # rotate more than 360 degrees (from 0 to 4095) And some mistake can happen while assembling the arm,
+            # you could end up with a servo with a position 0 or 4095 at a crucial point See [
+            # https://emanual.robotis.com/docs/en/dxl/x/x_series/#operating-mode11]
+            all_motors_except_gripper = [
+                name for name in self.follower_arms[name].motor_names if name != "gripper"
+            ]
+            if len(all_motors_except_gripper) > 0:
+                # 4 corresponds to Extended Position on Aloha motors
+                self.follower_arms[name].write("Operating_Mode", 4, all_motors_except_gripper)
+
+            # Use 'position control current based' for follower gripper to be limited by the limit of the current.
+            # It can grasp an object without forcing too much even tho,
+            # it's goal position is a complete grasp (both gripper fingers are ordered to join and reach a touch).
+            # 5 corresponds to Current Controlled Position on Aloha gripper follower "xm430-w350"
+            self.follower_arms[name].write("Operating_Mode", 5, "gripper")
+
+            # Note: We can't enable torque on the leader gripper since "xc430-w150" doesn't have
+            # a Current Controlled Position mode.
+        # set time profile after setting operation mode
+        for name in self.follower_arms:
+            self.follower_arms[name].write("Profile_Velocity", int(self.config.moving_time * 1000))
+
+        for name in self.leader_arms:
+            self.leader_arms[name].write("Profile_Velocity", int(self.config.moving_time * 1000))
+
+        if self.config.gripper_open_degree is not None:
+            warnings.warn(
+                f"`gripper_open_degree` is set to {self.config.gripper_open_degree}, but None is expected for Aloha instead",
+                stacklevel=1,
+            )
+
+    def connect(self):
+        if self.is_connected:
+            raise RobotDeviceAlreadyConnectedError(
+                "ManipulatorRobot is already connected. Do not run `robot.connect()` twice."
+            )
+
+        if not self.leader_arms and not self.follower_arms and not self.cameras:
+            raise ValueError(
+                "ManipulatorRobot doesn't have any device to connect. See example of usage in docstring of the class."
+            )
+
+        # Connect the arms
+        print("follower arms", self.follower_arms)
+        print("leader arms", self.leader_arms)
+        for name in self.follower_arms:
+            print(f"Connecting {name} follower arm.")
+            self.follower_arms[name].connect()
+        for name in self.leader_arms:
+            print(f"Connecting {name} leader arm.")
+            self.leader_arms[name].connect()
+
+        if self.robot_type in ["koch", "koch_bimanual", "aloha"]:
+            from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
+        elif self.robot_type in ["so100", "moss"]:
+            from lerobot.common.robot_devices.motors.feetech import TorqueMode
+
+        # We assume that at connection time, arms are in a rest position, and torque can
+        # be safely disabled to run calibration and/or set robot preset configurations.
+        for name in self.follower_arms:
+            self.follower_arms[name].write("Torque_Enable", TorqueMode.DISABLED.value)
+        for name in self.leader_arms:
+            self.leader_arms[name].write("Torque_Enable", TorqueMode.DISABLED.value)
+
+        self.activate_calibration()
+
+        # Set robot preset (e.g. torque in leader gripper for Koch v1.1)
+        if self.robot_type in ["koch", "koch_bimanual"]:
+            self.set_koch_robot_preset()
+        elif self.robot_type == "aloha":
+            self.set_aloha_robot_preset()
+        elif self.robot_type in ["so100", "moss"]:
+            self.set_so100_robot_preset()
+
+        # Enable torque on all motors of the follower arms
+        for name in self.follower_arms:
+            print(f"Activating torque on {name} follower arm.")
+            self.follower_arms[name].write("Torque_Enable", 1)
+
+        if self.config.gripper_open_degree is not None:
+            if self.robot_type not in ["koch", "koch_bimanual"]:
+                raise NotImplementedError(
+                    f"{self.robot_type} does not support position AND current control in the handle, which is require to set the gripper open."
+                )
+            # Set the leader arm in torque mode with the gripper motor set to an angle. This makes it possible
+            # to squeeze the gripper and have it spring back to an open position on its own.
+            for name in self.leader_arms:
+                self.leader_arms[name].write("Torque_Enable", 1, "gripper")
+                self.leader_arms[name].write("Goal_Position", self.config.gripper_open_degree, "gripper")
+
+        # Check both arms can be read
+        for name in self.follower_arms:
+            self.follower_arms[name].read("Present_Position")
+        for name in self.leader_arms:
+            self.leader_arms[name].read("Present_Position")
+
+        # Connect the cameras
+        for name in self.cameras:
+            self.cameras[name].connect()
+
+        self.is_connected = True
